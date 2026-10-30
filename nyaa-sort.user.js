@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Highlight Good and Bad Terms in Anchor Text
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Highlight release group names from TRaSH Guides tier lists on Nyaa.si search results, with options to hide unhighlighted / LQ results and sort by rank.
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/thetigeregg/nyaa-sort/main/nyaa-sort.user.js
@@ -374,10 +374,10 @@
     // Returns a Map of results-table row -> { rank, bad } for every row that
     // had at least one term highlighted. rank is the best (lowest) globalRank
     // matched in the row, or null if only bad terms matched.
-    const highlightAnchors = function(terms) {
+    const highlightAnchors = function(terms, root) {
         var rowMatches = new Map();
 
-        document.querySelectorAll('a').forEach(function(anchor) {
+        root.querySelectorAll('a').forEach(function(anchor) {
             if (anchor.children.length > 0) return;
 
             var text     = anchor.textContent;
@@ -423,9 +423,15 @@
     // also matched. When sorting by rank, ranked rows come first (best tier at
     // the top), then unhighlighted rows, then bad rows. Ties keep the page's
     // original order.
+    //
+    // "Load all pages" merges the search's other result pages into this table so
+    // the controls cover the whole search. It only runs when clicked, one page at
+    // a time, because Nyaa is behind DDoS-Guard and its rate limit is unknown.
     // ---------------------------------------------------------------------------
 
-    const SETTINGS_KEY = 'trash-highlighter-settings';
+    const SETTINGS_KEY  = 'trash-highlighter-settings';
+    const PAGE_DELAY_MS = 1000;
+    const RESULT_CAP    = 1000;
 
     const loadSettings = function() {
         var settings = { hidePlain: false, hideBad: false, sortByRank: false };
@@ -441,31 +447,86 @@
         } catch (err) { /* storage unavailable */ }
     };
 
-    const setupControls = function(rowMatches) {
+    // Returns the current page and total pages from Nyaa's pagination links.
+    const readPagination = function() {
+        var total = 1;
+        document.querySelectorAll('ul.pagination li a').forEach(function(link) {
+            var page = parseInt(link.textContent, 10);
+            if (page > total) total = page;
+        });
+        var active = document.querySelector('ul.pagination li.active a');
+        return { current: active ? parseInt(active.textContent, 10) : 1, total: total };
+    };
+
+    const fetchPageBody = async function(page) {
+        var url = new URL(location.href);
+        url.searchParams.set('p', page);
+
+        const response = await fetch(url.href);
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+
+        // A DDoS-Guard challenge can arrive as a 200 with no results table.
+        var doc   = new DOMParser().parseFromString(await response.text(), 'text/html');
+        var tbody = doc.querySelector('table.torrent-list > tbody');
+        if (!tbody) throw new Error('No results table in response');
+        return tbody;
+    };
+
+    // Nyaa's own script converts timestamps to local time only once, on page load.
+    const localizeTimestamps = function(root) {
+        if (typeof window._format_date !== 'function') return;
+        if (typeof window._format_time_difference !== 'function') return;
+
+        var now = (Date.now() / 1000) | 0;
+        root.querySelectorAll('[data-timestamp]').forEach(function(cell) {
+            var timestamp = parseInt(cell.getAttribute('data-timestamp'), 10);
+            if (!timestamp) return;
+            cell.textContent = window._format_date(new Date(timestamp * 1000), false);
+            cell.title       = window._format_time_difference(now - timestamp);
+        });
+    };
+
+    const setupControls = function(rowMatches, terms) {
         var table = document.querySelector('table.torrent-list');
         var tbody = table && table.tBodies[0];
         if (!tbody) return;
 
+        var pagination = readPagination();
         var plainCount = 0;
         var badCount   = 0;
-        var rows = Array.prototype.map.call(tbody.rows, function(row, i) {
-            var info = rowMatches.get(row);
-            var sortKey;
+        var seenLinks  = new Set();
+        var rows       = [];
 
-            if (!info) {
-                row.classList.add('trash-row-plain');
-                sortKey = TOTAL_COLLECTIONS + 1;
-                plainCount++;
-            } else if (info.bad) {
-                row.classList.add('trash-row-bad');
-                sortKey = TOTAL_COLLECTIONS + 2;
-                badCount++;
-            } else {
-                sortKey = info.rank;
-            }
+        var addRows = function(newRows, matches, page) {
+            Array.prototype.forEach.call(newRows, function(row, i) {
+                // New uploads can push a row onto the next page during a load.
+                var link = row.querySelector('a[href^="/view/"]');
+                var href = link && link.getAttribute('href').split('#')[0];
+                if (href) {
+                    if (seenLinks.has(href)) return;
+                    seenLinks.add(href);
+                }
 
-            return { row: row, index: i, sortKey: sortKey };
-        });
+                var info = matches.get(row);
+                var sortKey;
+
+                if (!info) {
+                    row.classList.add('trash-row-plain');
+                    sortKey = TOTAL_COLLECTIONS + 1;
+                    plainCount++;
+                } else if (info.bad) {
+                    row.classList.add('trash-row-bad');
+                    sortKey = TOTAL_COLLECTIONS + 2;
+                    badCount++;
+                } else {
+                    sortKey = info.rank;
+                }
+
+                rows.push({ row: row, page: page, index: i, sortKey: sortKey });
+            });
+        };
+
+        addRows(tbody.rows, rowMatches, pagination.current);
 
         var settings = loadSettings();
 
@@ -477,7 +538,7 @@
                 if (settings.sortByRank && a.sortKey !== b.sortKey) {
                     return a.sortKey - b.sortKey;
                 }
-                return a.index - b.index;
+                return a.page - b.page || a.index - b.index;
             }).forEach(function(item) {
                 tbody.appendChild(item.row);
             });
@@ -496,14 +557,83 @@
                 saveSettings(settings);
                 apply();
             });
+            var textNode = document.createTextNode(text);
             label.appendChild(input);
-            label.appendChild(document.createTextNode(text));
+            label.appendChild(textNode);
             bar.appendChild(label);
+            return textNode;
         };
 
-        addToggle('hidePlain',  'Hide unhighlighted (' + plainCount + ')');
-        addToggle('hideBad',    'Hide LQ groups (' + badCount + ')');
+        var plainText = addToggle('hidePlain', '');
+        var badText   = addToggle('hideBad', '');
         addToggle('sortByRank', 'Sort by rank');
+
+        var updateCounts = function() {
+            plainText.data = 'Hide unhighlighted (' + plainCount + ')';
+            badText.data   = 'Hide LQ groups (' + badCount + ')';
+        };
+        updateCounts();
+
+        if (pagination.total > 1) {
+            var pending = [];
+            for (var page = 1; page <= pagination.total; page++) {
+                if (page !== pagination.current) pending.push(page);
+            }
+
+            var button = document.createElement('button');
+            button.type        = 'button';
+            button.className   = 'btn btn-default btn-xs';
+            button.textContent = 'Load all pages (' + pagination.total + ')';
+
+            var finishLoading = function() {
+                var info   = document.querySelector('.pagination-page-info');
+                var capped = info && new RegExp('out of ' + RESULT_CAP + ' results').test(info.textContent);
+
+                document.querySelectorAll('ul.pagination, .pagination-page-info').forEach(function(el) {
+                    el.style.display = 'none';
+                });
+
+                var status = document.createElement('span');
+                status.textContent = 'All ' + rows.length + ' results loaded';
+                if (capped) status.textContent += ' (Nyaa shows ' + RESULT_CAP + ' at most)';
+                button.replaceWith(status);
+            };
+
+            button.addEventListener('click', async function() {
+                button.disabled = true;
+
+                while (pending.length) {
+                    var next = pending[0];
+                    button.textContent = 'Loading page ' + next + '/' + pagination.total + '…';
+
+                    var body;
+                    try {
+                        body = await fetchPageBody(next);
+                    } catch (err) {
+                        // Don't retry automatically: this may be a rate limit.
+                        console.error('[TRaSH Highlighter] Failed to load page ' + next + ':', err);
+                        button.textContent = 'Stopped at page ' + next + ', retry';
+                        button.disabled    = false;
+                        return;
+                    }
+
+                    var matches = highlightAnchors(terms, body);
+                    localizeTimestamps(body);
+                    addRows(body.rows, matches, next);
+                    updateCounts();
+                    apply();
+
+                    pending.shift();
+                    if (pending.length) {
+                        await new Promise(function(resolve) { setTimeout(resolve, PAGE_DELAY_MS); });
+                    }
+                }
+
+                finishLoading();
+            });
+
+            bar.appendChild(button);
+        }
 
         var anchorEl = table.closest('.table-responsive') || table;
         anchorEl.parentNode.insertBefore(bar, anchorEl);
@@ -518,9 +648,9 @@
     const main = async function() {
         injectStyles();
         const terms = await buildTerms();
-        const rowMatches = highlightAnchors(terms);
+        const rowMatches = highlightAnchors(terms, document);
         // Without any terms every row would count as unhighlighted.
-        if (terms.length) setupControls(rowMatches);
+        if (terms.length) setupControls(rowMatches, terms);
     };
 
     await main();
